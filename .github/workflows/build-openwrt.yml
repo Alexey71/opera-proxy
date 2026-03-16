@@ -1,0 +1,97 @@
+name: Сборка opera-proxy для OpenWrt (mediatek_filogic) - выбран SNAPSHOT
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt version (25.12.0 or SNAPSHOT)"
+        required: true
+        default: "SNAPSHOT"
+      opera_proxy_ref:
+        description: "opera-proxy branch/tag/commit"
+        required: true
+        default: "master"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout opera-proxy repository
+        uses: actions/checkout@v4
+        with:
+          path: opera-proxy
+          ref: ${{ github.event.inputs.opera_proxy_ref }}
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential git python3 rsync gawk unzip libncurses-dev wget file zstd
+
+      - name: Download and extract SDK
+        run: |
+          set -e -x
+          if [ "${{ github.event.inputs.openwrt_version }}" = "SNAPSHOT" ]; then
+            BASE_URL="https://downloads.openwrt.org/snapshots/targets/mediatek/filogic/"
+          else
+            BASE_URL="https://downloads.openwrt.org/releases/${{ github.event.inputs.openwrt_version }}/targets/mediatek/filogic/"
+          fi
+          SDK_URL=$(curl -s "${BASE_URL}" | grep -oP 'href="openwrt-sdk[^"]+\.tar\.(zst|xz)"' | sed -e 's/href="//' -e 's/"$//' | head -n1)
+          if [ -z "$SDK_URL" ]; then
+            echo "SDK file not found."
+            exit 1
+          fi
+          curl -fsLO "${BASE_URL}${SDK_URL}"
+          tar -xf "$(basename "$SDK_URL")"
+          rm -f *.tar.zst *.tar.xz
+          mv openwrt-sdk* openwrt
+
+      - name: Copy Makefile to SDK package directory
+        run: |
+          mkdir -p openwrt/package/opera-proxy
+          cp opera-proxy/openwrt-package/Makefile openwrt/package/opera-proxy/
+
+      - name: Create source tarball with proper structure
+        run: |
+          mkdir -p openwrt/dl
+          mkdir -p temp/opera-proxy-1.15.0
+          rsync -av --exclude=.git opera-proxy/ temp/opera-proxy-1.15.0/
+          tar -czf openwrt/dl/opera-proxy-1.15.0.tar.gz -C temp .
+          rm -rf temp
+
+      - name: Update feeds and install golang
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install golang
+          cd ..
+
+      - name: Prepare default config
+        run: |
+          cd openwrt
+          make defconfig
+          cd ..
+
+      - name: Force enable opera-proxy in config
+        run: |
+          cd openwrt
+          echo "CONFIG_PACKAGE_opera-proxy=y" >> .config
+          make oldconfig
+          grep "CONFIG_PACKAGE_opera-proxy" .config || (echo "Package not enabled!" && exit 1)
+          cd ..
+
+      - name: Compile the package
+        run: |
+          cd openwrt
+          make package/opera-proxy/compile V=s
+          cd ..
+
+      - name: Upload compiled package
+        uses: actions/upload-artifact@v4
+        with:
+          name: opera-proxy-${{ github.event.inputs.openwrt_version }}-mediatek_filogic
+          path: openwrt/bin/packages/**/opera-proxy*.apk
+          if-no-files-found: error
