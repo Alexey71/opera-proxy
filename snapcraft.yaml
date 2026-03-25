@@ -14,7 +14,7 @@ parts:
     build-packages:
       - make
       - git-core
-    source: https://github.com/Snawoot/opera-proxy
+    source: https://github.com/Alexey71/opera-proxy
     source-type: git
     override-pull: |
       craftctl default

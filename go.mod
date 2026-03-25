@@ -1,11 +1,11 @@
-module github.com/Snawoot/opera-proxy
+module github.com/Alexey71/opera-proxy
 
 go 1.24.1
 
 toolchain go1.24.2
 
 require (
-	github.com/Snawoot/go-http-digest-auth-client v1.1.3
+	github.com/Alexey71/go-http-digest-auth-client v1.1.3
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/ncruces/go-dns v1.3.2
 	github.com/things-go/go-socks5 v0.1.0

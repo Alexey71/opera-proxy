@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	dac "github.com/Snawoot/go-http-digest-auth-client"
+	dac "github.com/Alexey71/go-http-digest-auth-client"
 )
 
 const (

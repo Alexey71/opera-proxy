@@ -3,8 +3,6 @@ opera-proxy
 
 [![opera-proxy](https://snapcraft.io//opera-proxy/badge.svg)](https://snapcraft.io/opera-proxy)
 
-<img align="left" width="100" height="100" src="https://github.com/user-attachments/assets/aac4d29a-32b3-4e00-957c-3c7168228edc">
-
 Standalone Opera VPN client.
 
 Just run it and it'll start a plain HTTP proxy server forwarding traffic through "Opera VPN" proxies of your choice.
@@ -21,7 +19,7 @@ By default the application listens on 127.0.0.1:18080.
 
 #### Binaries
 
-Pre-built binaries are available [here](https://github.com/Snawoot/opera-proxy/releases/latest).
+Pre-built binaries are available [here](https://github.com/Alexey71/opera-proxy/releases/latest).
 
 #### Build from source
 
@@ -122,5 +120,4 @@ eu3.sec-tunnel.com,77.111.244.22,443
 
 ## See also
 
-* [Project wiki](https://github.com/Snawoot/opera-proxy/wiki)
 * [Community in Telegram](https://t.me/alternative_proxy)
