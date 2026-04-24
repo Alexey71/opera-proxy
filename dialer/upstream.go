@@ -115,9 +115,14 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		return nil, err
 	}
 	if uTLSServerName != "" {
-		// Custom cert verification logic:
-		// DO NOT send SNI extension of TLS ClientHello
-		// DO peer certificate verification against specified servername
+		// Custom TLS verification strategy:
+		//   - Do NOT send SNI in ClientHello (use fakeSNI, may be empty string).
+		//   - Verify the peer certificate against the real server name using
+		//     the explicit caPool (Mozilla NSS bundle via bundle.Roots()).
+		//
+		// No cross-signed intermediate injection needed: bundle.Roots() already
+		// contains USERTrust ECC CA as a trusted root, so Go's chain builder
+		// resolves Opera's certificate chain without any manual patching.
 		conn = tls.Client(conn, &tls.Config{
 			ServerName:         fakeSNI,
 			InsecureSkipVerify: true,
@@ -186,6 +191,12 @@ func (d *ProxyDialer) Address() (string, error) {
 	return d.address()
 }
 
+// readResponse reads an HTTP/1.1 response from the raw conn after a CONNECT
+// request. It reads byte-by-byte until the \r\n\r\n header terminator is found,
+// then hands the accumulated bytes to http.ReadResponse.
+//
+// Note: byte-by-byte reading is intentional — we must not over-read past the
+// end of headers into the tunneled TLS stream.
 func readResponse(r io.Reader, req *http.Request) (*http.Response, error) {
 	endOfResponse := []byte("\r\n\r\n")
 	buf := &bytes.Buffer{}

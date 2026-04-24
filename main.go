@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -23,12 +22,12 @@ import (
 
 	xproxy "golang.org/x/net/proxy"
 
-	"github.com/Alexey71/opera-proxy/clock"
-	"github.com/Alexey71/opera-proxy/dialer"
-	"github.com/Alexey71/opera-proxy/handler"
-	clog "github.com/Alexey71/opera-proxy/log"
-	"github.com/Alexey71/opera-proxy/resolver"
-	se "github.com/Alexey71/opera-proxy/seclient"
+	"github.com/xteamlyer/opera-proxy/clock"
+	"github.com/xteamlyer/opera-proxy/dialer"
+	"github.com/xteamlyer/opera-proxy/handler"
+	clog "github.com/xteamlyer/opera-proxy/log"
+	"github.com/xteamlyer/opera-proxy/resolver"
+	se "github.com/xteamlyer/opera-proxy/seclient"
 
 	_ "golang.org/x/crypto/x509roots/fallback"
 	"golang.org/x/crypto/x509roots/fallback/bundle"
@@ -37,6 +36,15 @@ import (
 const (
 	API_DOMAIN   = "api2.sec-tunnel.com"
 	PROXY_SUFFIX = "sec-tunnel.com"
+
+	// Default timeouts increased to reduce premature API errors on slow networks.
+	DEFAULT_TIMEOUT                  = 30 * time.Second
+	DEFAULT_SERVER_SELECTION_TIMEOUT = 60 * time.Second
+
+	// Reduced idle connection pool to lower resource usage on embedded/low-RAM hosts.
+	HTTP_MAX_IDLE_CONNS          = 10
+	HTTP_MAX_IDLE_CONNS_PER_HOST = 3
+	HTTP_IDLE_CONN_TIMEOUT       = 60 * time.Second
 )
 
 func perror(msg string) {
@@ -112,6 +120,9 @@ type CLIArgs struct {
 	proxy                  string
 	apiLogin               string
 	apiPassword            string
+	// randomAPICreds: when true, ignore --api-login/--api-password and
+	// generate a fresh cryptographically-random credential pair on every run.
+	randomAPICreds         bool
 	apiAddress             string
 	apiClientType          string
 	apiClientVersion       string
@@ -156,7 +167,8 @@ func parse_args() *CLIArgs {
 	flag.BoolVar(&args.socksMode, "socks-mode", false, "listen for SOCKS requests instead of HTTP")
 	flag.IntVar(&args.verbosity, "verbosity", 20, "logging verbosity "+
 		"(10 - debug, 20 - info, 30 - warning, 40 - error, 50 - critical)")
-	flag.DurationVar(&args.timeout, "timeout", 10*time.Second, "timeout for network operations")
+	flag.DurationVar(&args.timeout, "timeout", DEFAULT_TIMEOUT,
+		"timeout for network operations (default raised to 30s for better API reliability)")
 	flag.BoolVar(&args.showVersion, "version", false, "show program version and exit")
 	flag.StringVar(&args.proxy, "proxy", "", "sets base proxy to use for all dial-outs. "+
 		"Format: <http|https|socks5|socks5h>://[login:password@]host[:port] "+
@@ -164,8 +176,13 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.apiClientVersion, "api-client-version", se.DefaultSESettings.ClientVersion, "client version reported to SurfEasy API")
 	flag.StringVar(&args.apiClientType, "api-client-type", se.DefaultSESettings.ClientType, "client type reported to SurfEasy API")
 	flag.StringVar(&args.apiUserAgent, "api-user-agent", se.DefaultSESettings.UserAgent, "user agent reported to SurfEasy API")
-	flag.StringVar(&args.apiLogin, "api-login", "se0316", "SurfEasy API login")
-	flag.StringVar(&args.apiPassword, "api-password", "SILrMEPBmJuhomxWkfm3JalqHX2Eheg1YhlEZiMh8II", "SurfEasy API password")
+	flag.StringVar(&args.apiLogin, "api-login", "se0316",
+		"SurfEasy API login (ignored when -random-api-creds is set)")
+	flag.StringVar(&args.apiPassword, "api-password", "SILrMEPBmJuhomxWkfm3JalqHX2Eheg1YhlEZiMh8II",
+		"SurfEasy API password (ignored when -random-api-creds is set)")
+	flag.BoolVar(&args.randomAPICreds, "random-api-creds", false,
+		"generate a random API login/password pair on every run instead of using -api-login/-api-password; "+
+			"reduces fingerprinting and avoids credential-reuse bans")
 	flag.StringVar(&args.apiAddress, "api-address", "", fmt.Sprintf("override IP address of %s", API_DOMAIN))
 	flag.StringVar(&args.apiProxy, "api-proxy", "", "additional proxy server used to access SurfEasy API")
 	flag.Var(args.bootstrapDNS, "bootstrap-dns",
@@ -180,10 +197,13 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.fakeSNI, "fake-SNI", "", "domain name to use as SNI in communications with servers")
 	flag.StringVar(&args.overrideProxyAddress, "override-proxy-address", "", "use fixed proxy address instead of server address returned by SurfEasy API")
 	flag.Var(&args.serverSelection, "server-selection", "server selection policy (first/random/fastest)")
-	flag.DurationVar(&args.serverSelectionTimeout, "server-selection-timeout", 30*time.Second, "timeout given for server selection function to produce result")
-	flag.StringVar(&args.serverSelectionTestURL, "server-selection-test-url", "https://ajax.googleapis.com/ajax/libs/angularjs/1.8.2/angular.min.js",
+	flag.DurationVar(&args.serverSelectionTimeout, "server-selection-timeout", DEFAULT_SERVER_SELECTION_TIMEOUT,
+		"timeout given for server selection function to produce result (default raised to 60s)")
+	flag.StringVar(&args.serverSelectionTestURL, "server-selection-test-url",
+		"https://ajax.googleapis.com/ajax/libs/angularjs/1.8.2/angular.min.js",
 		"URL used for download benchmark by fastest server selection policy")
-	flag.Int64Var(&args.serverSelectionDLLimit, "server-selection-dl-limit", 0, "restrict amount of downloaded data per connection by fastest server selection")
+	flag.Int64Var(&args.serverSelectionDLLimit, "server-selection-dl-limit", 0,
+		"restrict amount of downloaded data per connection by fastest server selection")
 	flag.Func("config", "read configuration from file with space-separated keys and values", readConfig)
 	flag.Parse()
 	if args.country == "" {
@@ -200,8 +220,25 @@ func proxyFromURLWrapper(u *url.URL, next xproxy.Dialer) (xproxy.Dialer, error) 
 	if !ok {
 		return nil, errors.New("only context dialers are accepted")
 	}
-
 	return dialer.ProxyDialerFromURL(u, cdialer)
+}
+
+// buildAPITransport returns an http.Transport tuned for infrequent API calls:
+// reduced idle pool (saves goroutines/sockets), no forced HTTP/2.
+func buildAPITransport(
+	dialCtx func(context.Context, string, string) (net.Conn, error),
+	dialTLSCtx func(context.Context, string, string) (net.Conn, error),
+) *http.Transport {
+	return &http.Transport{
+		DialContext:           dialCtx,
+		DialTLSContext:        dialTLSCtx,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          HTTP_MAX_IDLE_CONNS,
+		MaxIdleConnsPerHost:   HTTP_MAX_IDLE_CONNS_PER_HOST,
+		IdleConnTimeout:       HTTP_IDLE_CONN_TIMEOUT,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 func run() int {
@@ -232,7 +269,8 @@ func run() int {
 
 	caPool := x509.NewCertPool()
 	if args.caFile != "" {
-		certs, err := ioutil.ReadFile(args.caFile)
+		// os.ReadFile replaces deprecated ioutil.ReadFile
+		certs, err := os.ReadFile(args.caFile)
 		if err != nil {
 			mainLogger.Error("Can't load CA file: %v", err)
 			return 15
@@ -290,35 +328,44 @@ func run() int {
 		mainLogger.Info("Using fixed API host address = %s", args.apiAddress)
 		seclientDialer = dialer.NewFixedDialer(args.apiAddress, seclientDialer)
 	} else if len(args.bootstrapDNS.values) > 0 {
-		resolver, err := resolver.FastFromURLs(caPool, args.bootstrapDNS.values...)
+		res, err := resolver.FastFromURLs(caPool, args.bootstrapDNS.values...)
 		if err != nil {
 			mainLogger.Critical("Unable to instantiate DNS resolver: %v", err)
 			return 4
 		}
-		seclientDialer = dialer.NewResolvingDialer(resolver, seclientDialer)
+		seclientDialer = dialer.NewResolvingDialer(res, seclientDialer)
 	}
 
 	// Dialing w/o SNI, receiving self-signed certificate, so skip verification.
-	// Either way we'll validate certificate of actual proxy server.
+	// Either way we validate the certificate of the actual proxy server.
 	tlsConfig := &tls.Config{
 		ServerName:         args.fakeSNI,
 		InsecureSkipVerify: true,
 	}
-	seclient, err := se.NewSEClient(args.apiLogin, args.apiPassword, &http.Transport{
-		DialContext: seclientDialer.DialContext,
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+
+	// Resolve which API credentials to use.
+	apiLogin := args.apiLogin
+	apiPassword := args.apiPassword
+	if args.randomAPICreds {
+		var err error
+		apiLogin, apiPassword, err = se.GenerateRandomAPICreds()
+		if err != nil {
+			mainLogger.Critical("Failed to generate random API credentials: %v", err)
+			return 17
+		}
+		mainLogger.Info("Using randomly generated API credentials (login prefix: %.8s...)", apiLogin)
+	}
+
+	seclient, err := se.NewSEClient(apiLogin, apiPassword, buildAPITransport(
+		seclientDialer.DialContext,
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := seclientDialer.DialContext(ctx, network, addr)
 			if err != nil {
 				return conn, err
 			}
 			return tls.Client(conn, tlsConfig), nil
 		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	})
+	))
 	if err != nil {
 		mainLogger.Critical("Unable to construct SEClient: %v", err)
 		return 8
@@ -473,7 +520,7 @@ func run() int {
 	if args.socksMode {
 		socks, initError := handler.NewSocksServer(handlerDialer, socksLogger)
 		if initError != nil {
-			mainLogger.Critical("Failed to start: %v", err)
+			mainLogger.Critical("Failed to start: %v", initError)
 			return 16
 		}
 		mainLogger.Info("Init complete.")
@@ -557,10 +604,7 @@ func dpExport(ips []se.SEIPEntry, seclient *se.SEClient, sni string) int {
 		if gotOne {
 			key = "#proxy"
 		}
-		wr.Write([]string{
-			key,
-			u.String(),
-		})
+		wr.Write([]string{key, u.String()})
 		gotOne = true
 	}
 	return 0

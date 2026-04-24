@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -20,6 +19,10 @@ const (
 	ANON_PASSWORD_BYTES              = 20
 	DEVICE_ID_BYTES                  = 20
 	READ_LIMIT                 int64 = 128 * 1024
+
+	// Byte length for randomly generated API credential components.
+	RANDOM_API_LOGIN_BYTES    = 16
+	RANDOM_API_PASSWORD_BYTES = 24
 )
 
 type SEEndpoints struct {
@@ -73,9 +76,24 @@ type SEClient struct {
 
 type StrKV map[string]string
 
-// Instantiates SurfEasy client with default settings and given API keys.
-// Optional `transport` parameter allows to override HTTP transport used
-// for HTTP calls
+// GenerateRandomAPICreds returns a cryptographically-random (login, password) pair
+// suitable for use as SurfEasy digest-auth credentials. Call this instead of
+// using the hardcoded defaults when -random-api-creds is set.
+func GenerateRandomAPICreds() (login, password string, err error) {
+	rng := rand.New(RandomSource)
+	login, err = randomCapitalHexString(rng, RANDOM_API_LOGIN_BYTES)
+	if err != nil {
+		return "", "", fmt.Errorf("generate random api login: %w", err)
+	}
+	password, err = randomCapitalHexString(rng, RANDOM_API_PASSWORD_BYTES)
+	if err != nil {
+		return "", "", fmt.Errorf("generate random api password: %w", err)
+	}
+	return login, password, nil
+}
+
+// NewSEClient instantiates a SurfEasy client with default settings and given API keys.
+// Optional transport parameter allows overriding the HTTP transport used for API calls.
 func NewSEClient(apiUsername, apiSecret string, transport http.RoundTripper) (*SEClient, error) {
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -293,7 +311,7 @@ func (c *SEClient) RpcCall(ctx context.Context, endpoint string, params map[stri
 }
 
 func (c *SEClient) rpcCall(ctx context.Context, endpoint string, params map[string]string, res interface{}) error {
-	input := make(url.Values)
+	input := make(url.Values, len(params))
 	for k, v := range params {
 		input[k] = []string{v}
 	}
@@ -330,10 +348,9 @@ func (c *SEClient) rpcCall(ctx context.Context, endpoint string, params map[stri
 	return nil
 }
 
-// Does cleanup of HTTP response in order to make it reusable by keep-alive
-// logic of HTTP client
+// cleanupBody drains and closes an HTTP response body to allow connection reuse.
 func cleanupBody(body io.ReadCloser) {
-	io.Copy(ioutil.Discard, &io.LimitedReader{
+	io.Copy(io.Discard, &io.LimitedReader{
 		R: body,
 		N: READ_LIMIT,
 	})

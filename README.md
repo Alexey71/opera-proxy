@@ -1,5 +1,8 @@
-opera-proxy
-===========
+# opera-proxy fork
+
+- Original author - [Snawoot](https://github.com/Snawoot)
+- Fork based - [Alexey71](https://github.com/Alexey71)
+- Some ideas - [SLY-F0X](https://github.com/SLY-F0X)
 
 Standalone Opera VPN client.
 
@@ -8,10 +11,10 @@ By default the application listens on 127.0.0.1:18080.
 
 ## Features
 
-* Cross-platform (Windows/Mac OS/Linux/Android (via shell)/\*BSD)
-* Uses TLS for secure communication with upstream proxies
-* Zero configuration
-* Simple and straightforward
+- Cross-platform (Windows/Mac OS/Linux/Android (via shell)/\*BSD)
+- Uses TLS for secure communication with upstream proxies
+- Zero configuration
+- Simple and straightforward
 
 ## Installation
 

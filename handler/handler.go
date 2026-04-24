@@ -12,14 +12,30 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Alexey71/opera-proxy/dialer"
-	clog "github.com/Alexey71/opera-proxy/log"
+	"github.com/xteamlyer/opera-proxy/dialer"
+	clog "github.com/xteamlyer/opera-proxy/log"
 )
 
 const (
 	COPY_BUF    = 128 * 1024
 	BAD_REQ_MSG = "Bad Request\n"
+
+	// Reduced idle pool: the proxy handler makes upstream connections per request,
+	// not persistent keep-alive sessions. 10 total / 2 per host is plenty and
+	// avoids leaking hundreds of idle goroutines/sockets under bursty traffic.
+	TRANSPORT_MAX_IDLE_CONNS          = 10
+	TRANSPORT_MAX_IDLE_CONNS_PER_HOST = 2
+	TRANSPORT_IDLE_CONN_TIMEOUT       = 60 * time.Second
 )
+
+// copyBufPool reuses 128 KiB buffers for bidirectional data relay,
+// avoiding per-connection heap allocations.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, COPY_BUF)
+		return &b
+	},
+}
 
 type ProxyHandler struct {
 	logger        *clog.CondLogger
@@ -27,17 +43,18 @@ type ProxyHandler struct {
 	httptransport http.RoundTripper
 }
 
-func NewProxyHandler(dialer dialer.ContextDialer, logger *clog.CondLogger) *ProxyHandler {
+func NewProxyHandler(d dialer.ContextDialer, logger *clog.CondLogger) *ProxyHandler {
 	httptransport := &http.Transport{
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          TRANSPORT_MAX_IDLE_CONNS,
+		MaxIdleConnsPerHost:   TRANSPORT_MAX_IDLE_CONNS_PER_HOST,
+		IdleConnTimeout:       TRANSPORT_IDLE_CONN_TIMEOUT,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DialContext:           dialer.DialContext,
+		DialContext:           d.DialContext,
 	}
 	return &ProxyHandler{
 		logger:        logger,
-		dialer:        dialer,
+		dialer:        d,
 		httptransport: httptransport,
 	}
 }
@@ -119,7 +136,10 @@ func proxy(ctx context.Context, left, right net.Conn) {
 	wg := sync.WaitGroup{}
 	cpy := func(dst, src net.Conn) {
 		defer wg.Done()
-		io.Copy(dst, src)
+		// Grab a pooled buffer for this copy direction.
+		bufp := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(bufp)
+		io.CopyBuffer(dst, src, *bufp)
 		dst.Close()
 	}
 	wg.Add(2)
@@ -145,7 +165,9 @@ func proxyh2(ctx context.Context, leftreader io.ReadCloser, leftwriter io.Writer
 	wg := sync.WaitGroup{}
 	ltr := func(dst net.Conn, src io.Reader) {
 		defer wg.Done()
-		io.Copy(dst, src)
+		bufp := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(bufp)
+		io.CopyBuffer(dst, src, *bufp)
 		dst.Close()
 	}
 	rtl := func(dst io.Writer, src io.Reader) {
@@ -226,12 +248,14 @@ func flush(flusher interface{}) bool {
 }
 
 func copyBody(wr io.Writer, body io.Reader) {
-	buf := make([]byte, COPY_BUF)
+	// Use pooled buffer to avoid per-call allocation.
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
 	for {
-		bread, read_err := body.Read(buf)
+		bread, read_err := body.Read(*bufp)
 		var write_err error
 		if bread > 0 {
-			_, write_err = wr.Write(buf[:bread])
+			_, write_err = wr.Write((*bufp)[:bread])
 			flush(wr)
 		}
 		if read_err != nil || write_err != nil {

@@ -14,12 +14,12 @@ jobs:
     steps:
       -
         name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       -
         name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v6
         with:
           go-version: 'stable'
       -
@@ -35,7 +35,7 @@ jobs:
           VERSION=${{steps.tag.outputs.tag}}
       -
         name: Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: bin/*
           fail_on_unmatched_files: true
