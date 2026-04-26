@@ -2,8 +2,26 @@ name: build
 
 on:
   push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create release? (yes/no)'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+      tag_name:
+        description: 'Release tag name (e.g., v1.2.3)'
+        required: false
+        default: ''
+        type: string
+      release_name:
+        description: 'Release name (optional, defaults to tag name)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -12,31 +30,48 @@ jobs:
       contents: write
 
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      -
-        name: Setup Go
+
+      - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: 'stable'
-      -
-        name: Read tag
-        id: tag
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-      -
-        name: Build
+          go-version: "stable"
+
+      - name: Build
         run: >-
           make -j $(nproc) allplus
           NDK_CC_ARM64="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
           NDK_CC_ARM="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
-          VERSION=${{steps.tag.outputs.tag}}
-      -
-        name: Release
+          VERSION=v1.17.1
+
+      - name: Upload artifact for arm64
+        uses: actions/upload-artifact@v7
+        with:
+          path: bin/opera-proxy.android-arm64
+          archive: false
+
+      - name: Upload artifact for win amd64
+        uses: actions/upload-artifact@v7
+        with:
+          path: bin/opera-proxy.windows-amd64.exe
+          archive: false
+
+      - name: Upload all artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: bin/*
+
+      - name: Create Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'yes'
         uses: softprops/action-gh-release@v3
         with:
-          files: bin/*
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: ${{ github.event.inputs.release_name || github.event.inputs.tag_name }}
+          files: bin/**/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+          draft: false
+          prerelease: false

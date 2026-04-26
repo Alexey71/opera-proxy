@@ -120,9 +120,6 @@ type CLIArgs struct {
 	proxy                  string
 	apiLogin               string
 	apiPassword            string
-	// randomAPICreds: when true, ignore --api-login/--api-password and
-	// generate a fresh cryptographically-random credential pair on every run.
-	randomAPICreds         bool
 	apiAddress             string
 	apiClientType          string
 	apiClientVersion       string
@@ -168,7 +165,7 @@ func parse_args() *CLIArgs {
 	flag.IntVar(&args.verbosity, "verbosity", 20, "logging verbosity "+
 		"(10 - debug, 20 - info, 30 - warning, 40 - error, 50 - critical)")
 	flag.DurationVar(&args.timeout, "timeout", DEFAULT_TIMEOUT,
-		"timeout for network operations (default raised to 30s for better API reliability)")
+		"timeout for network operations")
 	flag.BoolVar(&args.showVersion, "version", false, "show program version and exit")
 	flag.StringVar(&args.proxy, "proxy", "", "sets base proxy to use for all dial-outs. "+
 		"Format: <http|https|socks5|socks5h>://[login:password@]host[:port] "+
@@ -176,13 +173,8 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.apiClientVersion, "api-client-version", se.DefaultSESettings.ClientVersion, "client version reported to SurfEasy API")
 	flag.StringVar(&args.apiClientType, "api-client-type", se.DefaultSESettings.ClientType, "client type reported to SurfEasy API")
 	flag.StringVar(&args.apiUserAgent, "api-user-agent", se.DefaultSESettings.UserAgent, "user agent reported to SurfEasy API")
-	flag.StringVar(&args.apiLogin, "api-login", "se0316",
-		"SurfEasy API login (ignored when -random-api-creds is set)")
-	flag.StringVar(&args.apiPassword, "api-password", "SILrMEPBmJuhomxWkfm3JalqHX2Eheg1YhlEZiMh8II",
-		"SurfEasy API password (ignored when -random-api-creds is set)")
-	flag.BoolVar(&args.randomAPICreds, "random-api-creds", false,
-		"generate a random API login/password pair on every run instead of using -api-login/-api-password; "+
-			"reduces fingerprinting and avoids credential-reuse bans")
+	flag.StringVar(&args.apiLogin, "api-login", "se0316", "SurfEasy API login")
+	flag.StringVar(&args.apiPassword, "api-password", "SILrMEPBmJuhomxWkfm3JalqHX2Eheg1YhlEZiMh8II", "SurfEasy API password")
 	flag.StringVar(&args.apiAddress, "api-address", "", fmt.Sprintf("override IP address of %s", API_DOMAIN))
 	flag.StringVar(&args.apiProxy, "api-proxy", "", "additional proxy server used to access SurfEasy API")
 	flag.Var(args.bootstrapDNS, "bootstrap-dns",
@@ -198,7 +190,7 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.overrideProxyAddress, "override-proxy-address", "", "use fixed proxy address instead of server address returned by SurfEasy API")
 	flag.Var(&args.serverSelection, "server-selection", "server selection policy (first/random/fastest)")
 	flag.DurationVar(&args.serverSelectionTimeout, "server-selection-timeout", DEFAULT_SERVER_SELECTION_TIMEOUT,
-		"timeout given for server selection function to produce result (default raised to 60s)")
+		"timeout given for server selection function to produce result")
 	flag.StringVar(&args.serverSelectionTestURL, "server-selection-test-url",
 		"https://ajax.googleapis.com/ajax/libs/angularjs/1.8.2/angular.min.js",
 		"URL used for download benchmark by fastest server selection policy")
@@ -241,6 +233,40 @@ func buildAPITransport(
 	}
 }
 
+// buildCAPool constructs the x509 cert pool used for all TLS verification.
+// When -cafile is given, only that file is loaded (useful for custom/corporate CAs).
+// Otherwise the bundled Mozilla NSS root store is used, which includes all
+// major roots and supports AddCertWithConstraint for name-constrained CAs —
+// strictly better than a plain PEM file.
+func buildCAPool(caFile string, logger *clog.CondLogger) (*x509.CertPool, int) {
+	pool := x509.NewCertPool()
+	if caFile != "" {
+		certs, err := os.ReadFile(caFile)
+		if err != nil {
+			logger.Error("Can't load CA file: %v", err)
+			return nil, 15
+		}
+		if ok := pool.AppendCertsFromPEM(certs); !ok {
+			logger.Error("Can't load certificates from CA file")
+			return nil, 15
+		}
+		return pool, 0
+	}
+	for c := range bundle.Roots() {
+		cert, err := x509.ParseCertificate(c.Certificate)
+		if err != nil {
+			logger.Error("Unable to parse bundled certificate: %v", err)
+			return nil, 15
+		}
+		if c.Constraint == nil {
+			pool.AddCert(cert)
+		} else {
+			pool.AddCertWithConstraint(cert, c.Constraint)
+		}
+	}
+	return pool, 0
+}
+
 func run() int {
 	args := parse_args()
 	if args.showVersion {
@@ -267,31 +293,9 @@ func run() int {
 		KeepAlive: 30 * time.Second,
 	}
 
-	caPool := x509.NewCertPool()
-	if args.caFile != "" {
-		// os.ReadFile replaces deprecated ioutil.ReadFile
-		certs, err := os.ReadFile(args.caFile)
-		if err != nil {
-			mainLogger.Error("Can't load CA file: %v", err)
-			return 15
-		}
-		if ok := caPool.AppendCertsFromPEM(certs); !ok {
-			mainLogger.Error("Can't load certificates from CA file")
-			return 15
-		}
-	} else {
-		for c := range bundle.Roots() {
-			cert, err := x509.ParseCertificate(c.Certificate)
-			if err != nil {
-				mainLogger.Error("Unable to parse bundled certificate: %v", err)
-				return 15
-			}
-			if c.Constraint == nil {
-				caPool.AddCert(cert)
-			} else {
-				caPool.AddCertWithConstraint(cert, c.Constraint)
-			}
-		}
+	caPool, exitCode := buildCAPool(args.caFile, mainLogger)
+	if exitCode != 0 {
+		return exitCode
 	}
 
 	xproxy.RegisterDialerType("http", proxyFromURLWrapper)
@@ -314,12 +318,12 @@ func run() int {
 	if args.apiProxy != "" {
 		apiProxyURL, err := url.Parse(args.apiProxy)
 		if err != nil {
-			mainLogger.Critical("Unable to parse base proxy URL: %v", err)
+			mainLogger.Critical("Unable to parse api-proxy URL: %v", err)
 			return 6
 		}
 		pxDialer, err := xproxy.FromURL(apiProxyURL, seclientDialer)
 		if err != nil {
-			mainLogger.Critical("Unable to instantiate base proxy dialer: %v", err)
+			mainLogger.Critical("Unable to instantiate api-proxy dialer: %v", err)
 			return 7
 		}
 		seclientDialer = pxDialer.(dialer.ContextDialer)
@@ -336,27 +340,16 @@ func run() int {
 		seclientDialer = dialer.NewResolvingDialer(res, seclientDialer)
 	}
 
-	// Dialing w/o SNI, receiving self-signed certificate, so skip verification.
-	// Either way we validate the certificate of the actual proxy server.
+	// TLS config for the API connection: SNI suppressed (or faked), cert
+	// verification is skipped at the TLS layer because the API endpoint uses
+	// a self-signed cert — actual peer verification happens in VerifyConnection
+	// inside ProxyDialer for the proxy connections.
 	tlsConfig := &tls.Config{
 		ServerName:         args.fakeSNI,
 		InsecureSkipVerify: true,
 	}
 
-	// Resolve which API credentials to use.
-	apiLogin := args.apiLogin
-	apiPassword := args.apiPassword
-	if args.randomAPICreds {
-		var err error
-		apiLogin, apiPassword, err = se.GenerateRandomAPICreds()
-		if err != nil {
-			mainLogger.Critical("Failed to generate random API credentials: %v", err)
-			return 17
-		}
-		mainLogger.Info("Using randomly generated API credentials (login prefix: %.8s...)", apiLogin)
-	}
-
-	seclient, err := se.NewSEClient(apiLogin, apiPassword, buildAPITransport(
+	seclient, err := se.NewSEClient(args.apiLogin, args.apiPassword, buildAPITransport(
 		seclientDialer.DialContext,
 		func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := seclientDialer.DialContext(ctx, network, addr)
@@ -460,9 +453,7 @@ func run() int {
 				ss = dialer.NewFastestServerSelectionFunc(
 					args.serverSelectionTestURL,
 					args.serverSelectionDLLimit,
-					&tls.Config{
-						RootCAs: caPool,
-					},
+					&tls.Config{RootCAs: caPool},
 				)
 			default:
 				panic("unhandled server selection value got past parsing")
@@ -497,8 +488,7 @@ func run() int {
 		mainLogger.Info("Refreshing login...")
 		reqCtx, cl := context.WithTimeout(ctx, args.timeout)
 		defer cl()
-		err := seclient.Login(reqCtx)
-		if err != nil {
+		if err := seclient.Login(reqCtx); err != nil {
 			mainLogger.Error("Login refresh failed: %v", err)
 			return err
 		}
@@ -507,8 +497,7 @@ func run() int {
 		mainLogger.Info("Refreshing device password...")
 		reqCtx, cl = context.WithTimeout(ctx, args.timeout)
 		defer cl()
-		err = seclient.DeviceGeneratePassword(reqCtx)
-		if err != nil {
+		if err := seclient.DeviceGeneratePassword(reqCtx); err != nil {
 			mainLogger.Error("Device password refresh failed: %v", err)
 			return err
 		}
@@ -547,7 +536,6 @@ func printCountries(try func(string, func() error) error, logger *clog.CondLogge
 	if err != nil {
 		return 11
 	}
-
 	wr := csv.NewWriter(os.Stdout)
 	defer wr.Flush()
 	wr.Write([]string{"country code", "country name"})
@@ -591,10 +579,7 @@ func dpExport(ips []se.SEIPEntry, seclient *se.SEClient, sni string) int {
 		u := url.URL{
 			Scheme: "https",
 			User:   creds,
-			Host: net.JoinHostPort(
-				ip.IP,
-				strconv.Itoa(int(ip.Ports[0])),
-			),
+			Host:   net.JoinHostPort(ip.IP, strconv.Itoa(int(ip.Ports[0]))),
 			RawQuery: url.Values{
 				"sni":      []string{sni},
 				"peername": []string{fmt.Sprintf("%s%d.%s", strings.ToLower(ip.Geo.CountryCode), i, PROXY_SUFFIX)},

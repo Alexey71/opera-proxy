@@ -15,14 +15,10 @@ import (
 )
 
 const (
-	ANON_EMAIL_LOCALPART_BYTES       = 32
-	ANON_PASSWORD_BYTES              = 20
-	DEVICE_ID_BYTES                  = 20
-	READ_LIMIT                 int64 = 128 * 1024
-
-	// Byte length for randomly generated API credential components.
-	RANDOM_API_LOGIN_BYTES    = 16
-	RANDOM_API_PASSWORD_BYTES = 24
+	ANON_EMAIL_LOCALPART_BYTES = 32
+	ANON_PASSWORD_BYTES        = 20
+	DEVICE_ID_BYTES            = 20
+	READ_LIMIT           int64 = 128 * 1024
 )
 
 type SEEndpoints struct {
@@ -76,24 +72,10 @@ type SEClient struct {
 
 type StrKV map[string]string
 
-// GenerateRandomAPICreds returns a cryptographically-random (login, password) pair
-// suitable for use as SurfEasy digest-auth credentials. Call this instead of
-// using the hardcoded defaults when -random-api-creds is set.
-func GenerateRandomAPICreds() (login, password string, err error) {
-	rng := rand.New(RandomSource)
-	login, err = randomCapitalHexString(rng, RANDOM_API_LOGIN_BYTES)
-	if err != nil {
-		return "", "", fmt.Errorf("generate random api login: %w", err)
-	}
-	password, err = randomCapitalHexString(rng, RANDOM_API_PASSWORD_BYTES)
-	if err != nil {
-		return "", "", fmt.Errorf("generate random api password: %w", err)
-	}
-	return login, password, nil
-}
-
-// NewSEClient instantiates a SurfEasy client with default settings and given API keys.
-// Optional transport parameter allows overriding the HTTP transport used for API calls.
+// NewSEClient instantiates a SurfEasy client.
+// apiUsername/apiSecret are the application-level Digest Auth credentials
+// embedded in every Opera client — they are NOT per-user and must not be randomised.
+// transport may be nil (uses http.DefaultTransport).
 func NewSEClient(apiUsername, apiSecret string, transport http.RoundTripper) (*SEClient, error) {
 	if transport == nil {
 		transport = http.DefaultTransport
@@ -101,7 +83,7 @@ func NewSEClient(apiUsername, apiSecret string, transport http.RoundTripper) (*S
 
 	rng := rand.New(RandomSource)
 
-	device_id, err := randomCapitalHexString(rng, DEVICE_ID_BYTES)
+	deviceID, err := randomCapitalHexString(rng, DEVICE_ID_BYTES)
 	if err != nil {
 		return nil, err
 	}
@@ -111,17 +93,15 @@ func NewSEClient(apiUsername, apiSecret string, transport http.RoundTripper) (*S
 		return nil, err
 	}
 
-	res := &SEClient{
+	return &SEClient{
 		httpClient: &http.Client{
 			Jar:       jar,
 			Transport: dac.NewDigestTransport(apiUsername, apiSecret, transport),
 		},
 		Settings: DefaultSESettings,
 		rng:      rng,
-		DeviceID: device_id,
-	}
-
-	return res, nil
+		DeviceID: deviceID,
+	}, nil
 }
 
 func (c *SEClient) ResetCookies() error {
@@ -142,7 +122,8 @@ func (c *SEClient) AnonRegister(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
+	// Each run generates a fresh random subscriber identity — this is the
+	// actual anonymisation layer. The API-level credentials above are fixed.
 	c.SubscriberEmail = fmt.Sprintf("%s@%s.best.vpn", localPart, c.Settings.ClientType)
 	c.SubscriberPassword = capitalHexSHA1(c.SubscriberEmail)
 
@@ -156,22 +137,19 @@ func (c *SEClient) Register(ctx context.Context) error {
 }
 
 func (c *SEClient) register(ctx context.Context) error {
-	err := c.resetCookies()
-	if err != nil {
+	if err := c.resetCookies(); err != nil {
 		return err
 	}
-
 	var regRes SERegisterSubscriberResponse
-	err = c.rpcCall(ctx, c.Settings.Endpoints.RegisterSubscriber, StrKV{
+	err := c.rpcCall(ctx, c.Settings.Endpoints.RegisterSubscriber, StrKV{
 		"email":    c.SubscriberEmail,
 		"password": c.SubscriberPassword,
 	}, &regRes)
 	if err != nil {
 		return err
 	}
-
 	if regRes.Status.Code != SE_STATUS_OK {
-		return fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			regRes.Status.Code, regRes.Status.Message)
 	}
 	return nil
@@ -190,12 +168,10 @@ func (c *SEClient) RegisterDevice(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
 	if regRes.Status.Code != SE_STATUS_OK {
-		return fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			regRes.Status.Code, regRes.Status.Message)
 	}
-
 	c.AssignedDeviceID = regRes.Data.DeviceID
 	c.DevicePassword = regRes.Data.DevicePassword
 	c.AssignedDeviceIDHash = capitalHexSHA1(regRes.Data.DeviceID)
@@ -213,12 +189,10 @@ func (c *SEClient) GeoList(ctx context.Context) ([]SEGeoEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	if geoListRes.Status.Code != SE_STATUS_OK {
-		return nil, fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return nil, fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			geoListRes.Status.Code, geoListRes.Status.Message)
 	}
-
 	return geoListRes.Data.Geos, nil
 }
 
@@ -234,12 +208,10 @@ func (c *SEClient) Discover(ctx context.Context, requestedGeo string) ([]SEIPEnt
 	if err != nil {
 		return nil, err
 	}
-
 	if discoverRes.Status.Code != SE_STATUS_OK {
-		return nil, fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return nil, fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			discoverRes.Status.Code, discoverRes.Status.Message)
 	}
-
 	return discoverRes.Data.IPs, nil
 }
 
@@ -247,13 +219,11 @@ func (c *SEClient) Login(ctx context.Context) error {
 	c.Mux.Lock()
 	defer c.Mux.Unlock()
 
-	err := c.resetCookies()
-	if err != nil {
+	if err := c.resetCookies(); err != nil {
 		return err
 	}
-
 	var loginRes SESubscriberLoginResponse
-	err = c.rpcCall(ctx, c.Settings.Endpoints.SubscriberLogin, StrKV{
+	err := c.rpcCall(ctx, c.Settings.Endpoints.SubscriberLogin, StrKV{
 		"login":       c.SubscriberEmail,
 		"password":    c.SubscriberPassword,
 		"client_type": c.Settings.ClientType,
@@ -261,9 +231,8 @@ func (c *SEClient) Login(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
 	if loginRes.Status.Code != SE_STATUS_OK {
-		return fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			loginRes.Status.Code, loginRes.Status.Message)
 	}
 	return nil
@@ -280,12 +249,10 @@ func (c *SEClient) DeviceGeneratePassword(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
 	if genRes.Status.Code != SE_STATUS_OK {
-		return fmt.Errorf("API responded with error message: code=%d, msg=\"%s\"",
+		return fmt.Errorf("API responded with error message: code=%d, msg=%q",
 			genRes.Status.Code, genRes.Status.Message)
 	}
-
 	c.DevicePassword = genRes.Data.DevicePassword
 	return nil
 }
@@ -293,7 +260,6 @@ func (c *SEClient) DeviceGeneratePassword(ctx context.Context) error {
 func (c *SEClient) GetProxyCredentials() (string, string) {
 	c.Mux.Lock()
 	defer c.Mux.Unlock()
-
 	return c.AssignedDeviceIDHash, c.DevicePassword
 }
 
@@ -306,7 +272,6 @@ func (c *SEClient) populateRequest(req *http.Request) {
 func (c *SEClient) RpcCall(ctx context.Context, endpoint string, params map[string]string, res interface{}) error {
 	c.Mux.Lock()
 	defer c.Mux.Unlock()
-
 	return c.rpcCall(ctx, endpoint, params, res)
 }
 
@@ -315,12 +280,8 @@ func (c *SEClient) rpcCall(ctx context.Context, endpoint string, params map[stri
 	for k, v := range params {
 		input[k] = []string{v}
 	}
-	req, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		endpoint,
-		strings.NewReader(input.Encode()),
-	)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint,
+		strings.NewReader(input.Encode()))
 	if err != nil {
 		return err
 	}
@@ -334,25 +295,17 @@ func (c *SEClient) rpcCall(ctx context.Context, endpoint string, params map[stri
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		cleanupBody(resp.Body)
 		return fmt.Errorf("bad http status: %s, headers: %#v", resp.Status, resp.Header)
 	}
 
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(res)
+	err = json.NewDecoder(resp.Body).Decode(res)
 	cleanupBody(resp.Body)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 // cleanupBody drains and closes an HTTP response body to allow connection reuse.
 func cleanupBody(body io.ReadCloser) {
-	io.Copy(io.Discard, &io.LimitedReader{
-		R: body,
-		N: READ_LIMIT,
-	})
+	io.Copy(io.Discard, &io.LimitedReader{R: body, N: READ_LIMIT})
 	body.Close()
 }
