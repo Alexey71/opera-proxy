@@ -6,6 +6,7 @@ import (
 )
 
 const (
+	SILENT   = 60 // suppress all output, including critical errors
 	CRITICAL = 50
 	ERROR    = 40
 	WARNING  = 30

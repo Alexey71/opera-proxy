@@ -133,6 +133,8 @@ type CLIArgs struct {
 	caFile                 string
 	fakeSNI                string
 	overrideProxyAddress   string
+	proxyBypass            []string
+	proxyBypassFile        string
 	serverSelection        serverSelectionArg
 	serverSelectionTimeout time.Duration
 	serverSelectionTestURL string
@@ -163,7 +165,7 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.bindAddress, "bind-address", "127.0.0.1:18080", "proxy listen address")
 	flag.BoolVar(&args.socksMode, "socks-mode", false, "listen for SOCKS requests instead of HTTP")
 	flag.IntVar(&args.verbosity, "verbosity", 20, "logging verbosity "+
-		"(10 - debug, 20 - info, 30 - warning, 40 - error, 50 - critical)")
+		"(10 - debug, 20 - info, 30 - warning, 40 - error, 50 - critical, 60 - silent)")
 	flag.DurationVar(&args.timeout, "timeout", DEFAULT_TIMEOUT,
 		"timeout for network operations")
 	flag.BoolVar(&args.showVersion, "version", false, "show program version and exit")
@@ -188,6 +190,18 @@ func parse_args() *CLIArgs {
 	flag.StringVar(&args.caFile, "cafile", "", "use custom CA certificate bundle file")
 	flag.StringVar(&args.fakeSNI, "fake-SNI", "", "domain name to use as SNI in communications with servers")
 	flag.StringVar(&args.overrideProxyAddress, "override-proxy-address", "", "use fixed proxy address instead of server address returned by SurfEasy API")
+	flag.StringVar(&args.proxyBypassFile, "proxy-bypass-file", "", "path to file with bypass patterns, one per line (comments with #)")
+	flag.Func("proxy-bypass", "comma-separated bypass patterns; matched addresses connect directly.\n"+
+		"Formats: hostname (example.com), wildcard (*.example.com), IP (1.2.3.4), CIDR (10.0.0.0/8), any with optional :port suffix",
+		func(s string) error {
+			for _, part := range strings.Split(s, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					args.proxyBypass = append(args.proxyBypass, part)
+				}
+			}
+			return nil
+		})
 	flag.Var(&args.serverSelection, "server-selection", "server selection policy (first/random/fastest)")
 	flag.DurationVar(&args.serverSelectionTimeout, "server-selection-timeout", DEFAULT_SERVER_SELECTION_TIMEOUT,
 		"timeout given for server selection function to produce result")
@@ -283,7 +297,14 @@ func run() int {
 	proxyLogger := clog.NewCondLogger(log.New(logWriter, "PROXY   : ",
 		log.LstdFlags|log.Lshortfile),
 		args.verbosity)
-	socksLogger := log.New(logWriter, "SOCKS   : ",
+	// When verbosity >= SILENT, discard socks5 library logs entirely.
+	// go-socks5 writes through a raw *log.Logger which bypasses CondLogger,
+	// so we swap the writer to io.Discard to guarantee silence.
+	socksLogWriter := io.Writer(logWriter)
+	if args.verbosity >= clog.SILENT {
+		socksLogWriter = io.Discard
+	}
+	socksLogger := log.New(socksLogWriter, "SOCKS   : ",
 		log.LstdFlags|log.Lshortfile)
 
 	mainLogger.Info("opera-proxy client version %s is starting...", version())
@@ -292,6 +313,10 @@ func run() int {
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
+	// rawDialer is the bare net.Dialer before any -proxy wrapping.
+	// BypassDialer uses this as directDialer so that bypassed connections
+	// genuinely go direct — not through the base proxy.
+	rawDialer := d
 
 	caPool, exitCode := buildCAPool(args.caFile, mainLogger)
 	if exitCode != 0 {
@@ -484,6 +509,33 @@ func run() int {
 		mainLogger.Info("Endpoint override: %s", sanitizedEndpoint)
 	}
 
+	// Load bypass patterns from file if specified.
+	if args.proxyBypassFile != "" {
+		filePatterns, err := dialer.LoadBypassFile(args.proxyBypassFile)
+		if err != nil {
+			mainLogger.Critical("Unable to load bypass file: %v", err)
+			return 13
+		}
+		args.proxyBypass = append(args.proxyBypass, filePatterns...)
+	}
+	if len(args.proxyBypass) > 0 {
+		mainLogger.Info("Bypass rules (%d): %v", len(args.proxyBypass), args.proxyBypass)
+		bypassDialer, err := dialer.NewBypassDialer(args.proxyBypass, rawDialer, handlerDialer, mainLogger)
+		if err != nil {
+			mainLogger.Critical("Unable to configure bypass rules: %v", err)
+			return 13
+		}
+		// Pre-resolve hostname/wildcard patterns to IPs so that bypass works
+		// even when the SOCKS5 client resolves DNS itself and sends IP addresses.
+		// 20s timeout: Android may take longer to get network ready at daemon startup.
+		// nil resolver = net.DefaultResolver; on Android with CGO=0 this may fail
+		// for some patterns — those will still match by hostname if client sends SOCKS5h.
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		bypassDialer.ResolvePatterns(resolveCtx, nil)
+		resolveCancel()
+		handlerDialer = bypassDialer
+	}
+
 	clock.RunTicker(context.Background(), args.refresh, args.refreshRetry, func(ctx context.Context) error {
 		mainLogger.Info("Refreshing login...")
 		reqCtx, cl := context.WithTimeout(ctx, args.timeout)
@@ -601,6 +653,7 @@ func sanitizeFixedProxyAddress(addr string) string {
 	}
 	return net.JoinHostPort(addr, "443")
 }
+
 
 func main() {
 	os.Exit(run())
